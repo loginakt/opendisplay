@@ -485,63 +485,7 @@ final class StreamReceiver: ObservableObject {
     /// right after it, torn down with it. Losing it is never fatal; the
     /// sender falls back to TCP when hello carries no cursorPort.
     private func startCursorListener() {
-        stopCursorListener()
-        let params = NWParameters.udp
-        params.allowLocalEndpointReuse = true
-        params.includePeerToPeer = true
-        params.serviceClass = .responsiveData
-        let udp: NWListener
-        do {
-            udp = try NWListener(using: params, on: NWEndpoint.Port(rawValue: cursorPort)!)
-        } catch {
-            Log.info("cursor listener failed on udp :\(cursorPort): \(error) (cursor stays on TCP)")
-            return
-        }
-        cursorListener = udp
-        udp.newConnectionHandler = { [weak self] conn in
-            guard let self, self.cursorListener === udp else { conn.cancel(); return }
-            // A UDP "connection" is one remote host:port flow. The newest
-            // one is the live sender (a rebuilt sender socket gets a fresh
-            // ephemeral port) and starts its sequence over.
-            self.cursorConnection?.cancel()
-            self.cursorConnection = conn
-            self.lastCursorSeq = 0
-            conn.stateUpdateHandler = { [weak self] state in
-                guard let self, self.cursorConnection === conn else { return }
-                if case .failed(let error) = state {
-                    Log.info("cursor channel failed: \(error)")
-                    self.cursorConnection = nil
-                }
-            }
-            conn.start(queue: self.queue)
-            self.receiveCursorDatagrams(on: conn)
-        }
-        udp.stateUpdateHandler = { [weak self] state in
-            guard let self, self.cursorListener === udp else { return }
-            switch state {
-            case .ready:
-                self.cursorListenerReady = true
-                Log.info("cursor listener ready on udp :\(self.cursorPort)")
-                // hello may already be out without the port (the sender
-                // connected before UDP bound); re-send so it can switch.
-                if let connection, connection.state == .ready, !self.cursorPortAnnounced {
-                    self.sendHello(on: connection)
-                }
-            case .failed(let error):
-                Log.info("cursor listener failed: \(error) (cursor stays on TCP)")
-                let wasAnnounced = self.cursorPortAnnounced
-                self.stopCursorListener()
-                // Withdraw the offer: a hello without cursorPort makes the
-                // sender close its channel and return to TCP.
-                if wasAnnounced, let connection = self.connection, connection.state == .ready {
-                    self.sendHello(on: connection)
-                }
-            case .cancelled:
-                self.cursorListenerReady = false
-            default: break
-            }
-        }
-        udp.start(queue: queue)
+        stopCursorListener() // USB carries cursor updates on its byte stream.
     }
 
     private func stopCursorListener() {
@@ -593,11 +537,7 @@ final class StreamReceiver: ObservableObject {
             // noDelay matters most in THIS direction: touch events are tiny
             // packets, and Nagle would hold each one until the previous is
             // ACKed — batched, late drags read as input lag.
-            let tcp = NWProtocolTCP.Options()
-            tcp.noDelay = true
-            let params = NWParameters(tls: nil, tcp: tcp)
-            params.allowLocalEndpointReuse = true
-            params.serviceClass = .interactiveVideo
+            let params = USBOnlyTransport.receiverParameters(port: port)
             listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
         } catch {
             setStatus("Listener failed: \(error.localizedDescription)")
@@ -605,9 +545,10 @@ final class StreamReceiver: ObservableObject {
         }
         // Advertise on the local network so the Mac can discover us for WiFi
         // mode (USB/usbmux connects straight to the port and ignores this).
-        listener?.service = advertisedService
+        listener?.service = nil // USB-only: never advertise on the LAN.
         listener?.newConnectionHandler = { [weak self] conn in
             guard let self else { return }
+            guard USBOnlyTransport.accepts(conn.endpoint) else { conn.cancel(); return }
             Log.info("new connection from \(String(describing: conn.endpoint))")
             // usbmux-forwarded (cable) connections arrive from loopback;
             // anything else came over the network.
@@ -991,7 +932,7 @@ final class StreamReceiver: ObservableObject {
         // phone's radio — and then have the session classified as a cable
         // whose loss must end it instead of reconnecting.
         if acceptsPowerActions(on: conn) { hello["power"] = powerActions.map(\.rawValue) }
-        let addrs = advertisesAddresses ? Self.reachableAddresses() : []
+        let addrs: [String] = [] // Never offer network endpoints.
         if !addrs.isEmpty { hello["addrs"] = addrs }
         lastAdvertisedAddrs = addrs
         // A provisional hello goes to a candidate while the old connection is
@@ -1136,6 +1077,12 @@ final class StreamReceiver: ObservableObject {
         while buffer.distance(from: cursor, to: buffer.endIndex) >= 4 {
             let len = buffer[cursor..<buffer.index(cursor, offsetBy: 4)]
                 .withUnsafeBytes { Int(UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self))) }
+            guard len > 0, len <= USBOnlyTransport.maximumFrameLength else {
+                buffer.removeAll(keepingCapacity: false)
+                connection?.cancel()
+                setStatus("Invalid USB frame length")
+                return
+            }
             guard buffer.distance(from: cursor, to: buffer.endIndex) >= 4 + len else { break }
             let start = buffer.index(cursor, offsetBy: 4)
             let end = buffer.index(start, offsetBy: len)

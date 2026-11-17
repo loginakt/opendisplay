@@ -13,7 +13,7 @@
 // an external tool; speaking the protocol directly drops that dependency.
 
 import Foundation
-import Network
+@preconcurrency import Network
 
 struct UsbmuxDevice: Hashable, Identifiable {
     let deviceID: Int     // usbmuxd's handle — changes on every replug

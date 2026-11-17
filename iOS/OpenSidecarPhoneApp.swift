@@ -122,7 +122,7 @@ struct ReceiverScreen: View {
         } message: {
             if let update = recommendedUpdate { Text(update.message) }
         }
-        .task { await versionGate.check() }
+        // USB fork: no upstream remote version gate or update redirection.
         // Merge the connected Mac's compatibility signal into the same gate.
         .onReceive(model.receiver.$peerSignal) { versionGate.applyPeer($0) }
         .onReceive(NotificationCenter.default.publisher(for: .deviceDidShake)) { _ in
@@ -208,8 +208,8 @@ struct IdleView: View {
             VStack(alignment: .leading, spacing: 14) {
                 HintRow("Plug in the USB cable and open OpenDisplay on your computer",
                         systemImage: "cable.connector")
-                HintRow("Or pick this \(deviceKind) under WiFi in OpenDisplay on your computer",
-                        systemImage: "wifi")
+                HintRow("Wi-Fi streaming is disabled in this USB-only build.",
+                        systemImage: "lock.shield")
                 HintRow("Keep this app open. Streaming starts automatically.",
                         systemImage: "play.circle")
             }
@@ -284,7 +284,7 @@ struct OnboardingView: View {
                         Text("One more app to go")
                             .font(.title2.bold())
                             .multilineTextAlignment(.center)
-                        Text("OpenDisplay turns this \(deviceKind) into a second screen for your Mac. It needs the **OpenDisplay Mac app** running on a Mac connected by the same USB cable or on the same WiFi network.")
+                        Text("OpenDisplay turns this \(deviceKind) into a second screen for your Mac. It needs the **OpenDisplay Mac app** running on a Mac connected by the same USB data cable.")
                             .font(.body)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
@@ -293,7 +293,7 @@ struct OnboardingView: View {
 
                     VStack(alignment: .leading, spacing: 14) {
                         HintRow("Install the OpenDisplay Mac app on your Mac", systemImage: "1.circle.fill")
-                        HintRow("Connect the \(deviceKind) by USB, or join the same WiFi", systemImage: "2.circle.fill")
+                        HintRow("Connect the \(deviceKind) by a USB data cable", systemImage: "2.circle.fill")
                         HintRow("Keep this app open. Streaming starts automatically.", systemImage: "3.circle.fill")
                     }
                     .font(.subheadline)
@@ -384,7 +384,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Name")
                 } footer: {
-                    Text("Shown in the WiFi list of OpenDisplay on your computer. iOS hides this \(deviceKind)'s real name from apps, so set it here once.")
+                    Text("A friendly name for this USB receiver.")
                 }
 
                 Section {
@@ -405,7 +405,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Permissions")
                 } footer: {
-                    Text("WiFi mode needs Local Network access. If your computer can't find this \(deviceKind), enable it under Settings → Privacy & Security → Local Network → OpenDisplay. USB mode works without it.")
+                    Text("This USB-only build does not need Local Network permission. It never advertises or accepts streams on Wi-Fi.")
                 }
 
                 Section {
@@ -423,7 +423,7 @@ struct SettingsView: View {
                 Section {
                     Label("USB: plug in the cable and open OpenDisplay on your computer. It connects through the wire on its own (lowest latency).",
                           systemImage: "cable.connector")
-                    Label("WiFi: both devices on the same network, then pick this \(deviceKind) in OpenDisplay on your computer.",
+                    Label("Wi-Fi streaming is unavailable in this build.",
                           systemImage: "wifi")
                     Label("Rotate the \(deviceKind) for a vertical second monitor.",
                           systemImage: "rotate.right")
@@ -438,7 +438,7 @@ struct SettingsView: View {
                         Label("Get the Mac app", systemImage: "arrow.down.circle")
                     }
                 } footer: {
-                    Text("OpenDisplay needs the Mac app running on a Mac on the same cable or WiFi network. Download it here if you haven't yet.")
+                    Text("OpenDisplay needs the Mac app running on a Mac on the same USB cable. Download it here if you haven't yet.")
                 }
 
                 Section("About") {

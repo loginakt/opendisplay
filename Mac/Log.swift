@@ -52,7 +52,7 @@ enum Log {
 
     static func info(_ message: String) {
         let line = "[\(formatter.string(from: Date()))] \(message)\n"
-        print(line, terminator: "")
+        FileHandle.standardError.write(Data(line.utf8))
         guard let data = line.data(using: .utf8) else { return }
         queue.async { writer.append(data) }
     }

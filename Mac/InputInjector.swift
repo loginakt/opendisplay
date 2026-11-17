@@ -73,6 +73,7 @@ final class InputInjector {
 
     /// x/y are normalized [0,1] in video space (origin top-left).
     func handleTouch(phase: String, x: Double, y: Double) {
+        guard x.isFinite, y.isFinite, (0...1).contains(x), (0...1).contains(y) else { return }
         let bounds = CGDisplayBounds(displayID)   // global CG coords, y-down
         let point = CGPoint(
             x: bounds.origin.x + x * bounds.width,
@@ -116,6 +117,7 @@ final class InputInjector {
     /// dx/dy in display pixels, natural-scrolling sign from the phone.
     /// Scroll events take points, so convert via the display's pixel scale.
     func handleScroll(dx: Double, dy: Double) {
+        guard dx.isFinite, dy.isFinite, abs(dx) <= 100_000, abs(dy) <= 100_000 else { return }
         let bounds = CGDisplayBounds(displayID)
         let scale = bounds.width > 0 ? Double(CGDisplayPixelsWide(displayID)) / bounds.width : 2
         guard let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
@@ -127,12 +129,16 @@ final class InputInjector {
     }
 
     func handleProximity(entering: Bool, x: Double, y: Double) {
+        guard x.isFinite, y.isFinite, (0...1).contains(x), (0...1).contains(y) else { return }
         setProximity(entering: entering, at: screenPoint(nx: x, ny: y))
     }
 
     func handlePencil(phase: String, x: Double, y: Double,
                       pressure: Double, azimuth: Double, altitude: Double,
                       rotation: Double) {
+        guard x.isFinite, y.isFinite, (0...1).contains(x), (0...1).contains(y),
+              pressure.isFinite, (0...1).contains(pressure), azimuth.isFinite,
+              altitude.isFinite, rotation.isFinite else { return }
         // TODO: Wire Apple Pencil Pro barrel roll (UIKit rollAngle) once hardware
         // is available for testing. rotation on the wire is always 0 for now.
         _ = rotation
