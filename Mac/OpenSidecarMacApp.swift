@@ -80,6 +80,12 @@ final class USBDisplayController: NSObject, NSApplicationDelegate, ObservableObj
     func connect(id: String, mode: CaptureMode, touch: Bool = false) {
         guard devices.contains(where: { $0.udid == id }) else { return }
         stop()
+        guard !NSWorkspace.shared.runningApplications.contains(where: {
+            $0.bundleIdentifier == "com.peetzweg.opensidecar.mac"
+        }) else {
+            status = "Quit standalone OpenDisplay on this Mac, then connect again. Keep OpenDisplay open on the iPhone."
+            emit(); return
+        }
         guard CGPreflightScreenCaptureAccess() else {
             status = "Screen Recording permission is required. Grant it and restart the app."
             emit(); return
