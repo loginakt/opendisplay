@@ -1,3 +1,5 @@
+> **Unofficial USB-only Apple fork for CablePanel.** The Mac sender and iOS receiver in this branch disable Wi-Fi display transport. See [USB build instructions and limitations](USB/README.md). The upstream feature descriptions below also document functionality removed from these Apple builds.
+
 > [!NOTE]
 > **🌴 Away until November 17**
 >
