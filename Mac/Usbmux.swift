@@ -218,6 +218,7 @@ enum Usbmux {
 final class UsbmuxDeviceWatcher {
     private let queue = DispatchQueue(label: "usbmux.watcher")
     private var devices: [Int: UsbmuxDevice] = [:]
+    private var inventoryRevision = 0
     private let onChange: ([UsbmuxDevice]) -> Void
 
     init(onChange: @escaping ([UsbmuxDevice]) -> Void) {
@@ -235,8 +236,11 @@ final class UsbmuxDeviceWatcher {
     func refresh() { Task { await loadInitiallyAttachedDevices() } }
 
     private func loadInitiallyAttachedDevices() async {
+        inventoryRevision += 1
+        let revision = inventoryRevision
         do {
             let attached = try await Usbmux.listDevices(queue: queue)
+            guard revision == inventoryRevision else { return }
             devices = Dictionary(uniqueKeysWithValues: attached.map { ($0.deviceID, $0) })
             for device in attached {
                 devices[device.deviceID] = device
@@ -275,6 +279,7 @@ final class UsbmuxDeviceWatcher {
 
     private func handle(_ message: [String: Any]) {
         guard let deviceID = message["DeviceID"] as? Int else { return }
+        inventoryRevision += 1 // an attach/detach invalidates an in-flight snapshot
         switch message["MessageType"] as? String {
         case "Attached":
             guard let device = Usbmux.device(

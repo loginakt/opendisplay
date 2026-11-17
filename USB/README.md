@@ -21,7 +21,7 @@ the App Store build and it does not fetch the upstream force-update manifest.
 
 The official App Store receiver can work with the USB sender, but it still has
 its own network listener. For the complete USB-only boundary, install this fork's
-iOS receiver, or disable the official receiver's Local Network permission. Never
+iOS receiver, or switch off iPhone Wi-Fi in Settings while using the existing app over USB. Never
 interpret a USB connection to the official receiver as proof that its Wi-Fi
 listener is off.
 
@@ -52,3 +52,8 @@ The simulator and automated tests do not demonstrate screen capture on a real
 iPhone. A real USB session, both display modes, rotation, unplug during capture,
 and host termination must be checked on hardware before treating this as ready
 for daily use. Preserve the upstream license and attribution.
+
+The existing App Store receiver is supported without Developer Mode. Disabling
+Local Network permission does not itself block incoming TCP (Apple TN3179);
+keep iPhone Wi-Fi off in Settings for the USB-only campus setup. The sender
+cannot remotely enforce or inspect that setting in the unmodified phone app.

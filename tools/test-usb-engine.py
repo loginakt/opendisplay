@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Smoke-test the actual helper: rejects network CLI, no IP sockets, parent EOF stops it."""
-import json, selectors, subprocess, sys
+import json, selectors, subprocess, sys, os, time
 from pathlib import Path
 engine = str(Path(sys.argv[1] if len(sys.argv) > 1 else 'build/USBDisplayEngine').resolve())
 for args in [['-host', '127.0.0.1'], ['--port', '9000'], ['--wifi']]:
@@ -12,6 +12,17 @@ try:
     assert selector.select(10), 'helper did not publish initial state'
     state = json.loads(p.stdout.readline())
     assert state['transport'] == 'usb' and state['activeDevice'] == ''
+    # Commands must be consumed before EOF or a full pipe buffer. Drain startup
+    # events, then request Stop and require its distinct response promptly.
+    p.stdin.write(b'{"action":"stop"}\n'); p.stdin.flush()
+    pending = b''; deadline = time.monotonic() + 3; stopped = False
+    while time.monotonic() < deadline and not stopped:
+        if not selector.select(max(0, deadline - time.monotonic())): break
+        pending += os.read(p.stdout.fileno(), 65536)
+        while b'\n' in pending:
+            line, pending = pending.split(b'\n', 1)
+            if json.loads(line)['status'] == 'Stopped. USB connection required.': stopped = True
+    assert stopped, 'helper buffered a control command instead of responding while stdin stayed open'
     sockets = subprocess.run(['/usr/sbin/lsof', '-nP', '-a', '-p', str(p.pid), '-i'], capture_output=True, text=True)
     assert sockets.returncode == 1 and not sockets.stdout, sockets.stdout
     p.stdin.write(b'{"action":"connect","device":"nonexistent","mode":"extend","host":"192.168.1.2"}\n'); p.stdin.flush()

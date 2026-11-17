@@ -39,7 +39,13 @@ final class USBDisplayController: NSObject, NSApplicationDelegate, ObservableObj
         }
         if stdio {
             FileHandle.standardInput.readabilityHandler = { [weak self] handle in
-                let data = (try? handle.read(upToCount: 16_384)) ?? Data()
+                // POSIX read returns the currently available bytes. Foundation's
+                // read(upToCount:) can wait for the requested size on an open pipe.
+                var bytes = [UInt8](repeating: 0, count: 16_384)
+                let count = Darwin.read(handle.fileDescriptor, &bytes, bytes.count)
+                if count < 0 && errno == EINTR { return }
+                let data = count > 0 ? Data(bytes.prefix(count)) : Data()
+                if data.isEmpty { handle.readabilityHandler = nil }
                 Task { @MainActor in self?.consume(data) }
             }
         }
