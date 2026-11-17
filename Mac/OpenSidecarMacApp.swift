@@ -39,7 +39,7 @@ final class USBDisplayController: NSObject, NSApplicationDelegate, ObservableObj
         }
         if stdio {
             FileHandle.standardInput.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
+                let data = (try? handle.read(upToCount: 16_384)) ?? Data()
                 Task { @MainActor in self?.consume(data) }
             }
         }
@@ -61,6 +61,8 @@ final class USBDisplayController: NSObject, NSApplicationDelegate, ObservableObj
                       let modeName = command["mode"] as? String,
                       let mode = CaptureMode(rawValue: modeName) else { continue }
                 connect(id: id, mode: mode, touch: command["touch"] as? Bool ?? false)
+            case "refresh": watcher?.refresh(); emit()
+            case "accessibilityPermission": _ = InputInjector.ensureAccessibilityPermission(); emit()
             case "stop": stop()
             case "permission": CGRequestScreenCaptureAccess(); emit()
             case "quit": quit()
@@ -167,6 +169,14 @@ struct USBDisplayMain {
         let stdio = args == ["--control-stdio"]
         app.setActivationPolicy(stdio ? .prohibited : .regular)
         let controller = USBDisplayController(stdio: stdio)
+        // A hung main queue must not keep capture alive after the host crashes.
+        let parent = getppid()
+        let parentWatch = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        if stdio {
+            parentWatch.schedule(deadline: .now() + 0.5, repeating: 0.5)
+            parentWatch.setEventHandler { if getppid() != parent { _exit(0) } }
+        }
+        parentWatch.resume()
         app.delegate = controller
         var window: NSWindow?
         if !stdio {
@@ -178,6 +188,6 @@ struct USBDisplayMain {
             window = panel
             app.activate(ignoringOtherApps: true)
         }
-        withExtendedLifetime((controller, window)) { app.run() }
+        withExtendedLifetime((controller, window, parentWatch)) { app.run() }
     }
 }

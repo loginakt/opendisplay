@@ -228,56 +228,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // receiver's advertised addresses over non-WiFi paths and migrate the
     // session the moment one answers — the Mac-to-Mac analogue of the
     // iPhone's WiFi→USB transport switch. All confined to `queue`.
-    private var upgradeTimer: DispatchSourceTimer?
-    private var upgradeProbes: [NWConnection] = []
-    private var probeRoundGeneration = 0
-    private var lastLoggedCandidates: [String] = []
-    private var probeOutcomes: [String] = []
-    private var lastLoggedProbeOutcomes: [String] = []
-    private var peerAddrs: [String] = []
-    // The Mac-to-Mac USB link takes ~25-30s to negotiate, and either side
-    // can finish last. Peer-side lateness arrives as a re-hello; this
-    // monitor catches OUR side coming up, so a probe fires the moment the
-    // local interface is routable instead of up to 10s later.
-    private var wiredPathMonitor: NWPathMonitor?
-    // Probing is gated on this, not on wired-ness: the upgrade exists to get
-    // OFF WiFi, and any non-WiFi path (bridge, USB-C link, even loopback)
-    // is already as good as a probe could find — re-probing there would
-    // migrate in a circle.
-    private var currentPathUsesWiFi = false
-    // Set while the live session rides the direct cable link (USB-C /
-    // Thunderbolt host-to-host to a Mac receiver, link-local addressed).
-    // Losing that link is treated as intent — see linkDied(). A merely-
-    // wired path (a docked Mac on Ethernet streaming to a phone on WiFi)
-    // must NOT count: silence there is a backgrounded receiver or the
-    // phone's radio, and undocking should fall back to WiFi like it always
-    // has. Computed by refreshDirectLinkClassification, cleared the moment
-    // the session decides to redial (scheduleReconnect/switchTransport):
-    // dial-phase failures take the grace/refusal rules, never this exit.
-    private var currentPathDirectLink = false
     private var lastCursorSent: (x: Double, y: Double, visible: Bool) = (-1, -1, false)
     private var lastCursorPNGHash = 0
-    // Cursor side channel (UDP, WiFi only): positions queue behind video
-    // frames on the shared TCP socket and stutter under head-of-line
-    // blocking. Opened when hello advertises cursorPort; while ready,
-    // pollCursorPosition sends there instead. Sprites stay on TCP (up to
-    // 24 KB, must arrive intact). Network state lives on `queue`; position
-    // sampling, sequencing, and `lastCursorSent` live on `cursorQueue`.
-    // The lock only publishes UDP readiness across those two queues.
-    private let cursorNetworkLock = NSLock()
-    private var cursorConnection: NWConnection?
-    private var cursorChannelPort: NWEndpoint.Port?
-    // Connection generation that negotiated `cursorConnection`. Protected by
-    // `cursorNetworkLock` with the socket so an old cursorQueue sample cannot
-    // resume after reconnect and adopt the new session's UDP flow.
-    private var cursorConnectionGeneration: UInt64 = 0
-    // True once the receiver acked a datagram (cursorAck). Until then every
-    // position also rides TCP: UDP .ready proves only a local route, and a
-    // silently firewalled port must not eat the cursor. Duplicates are
-    // harmless — both paths carry the same sequence and the receiver drops
-    // whatever is not newer.
-    private var cursorChannelConfirmed = false
-    private var cursorConnectionReady = false
     private var cursorSeq: UInt64 = 0
     // The TCP fallback crosses from `cursorQueue` to the sender `queue`.
     // Carry the session that owned the sample so a position queued just before
@@ -1408,8 +1360,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // UDP callbacks run there); tearing it down from the main actor races
         // them.
         queue.async { [weak self] in
-            self?.closeCursorChannel()
-            self?.stopUpgradeProbing()
             self?.captureRecoveryWork?.cancel()
             self?.captureRecoveryWork = nil
             // Scheduled from hello handling, which runs on `queue` too.
@@ -1429,18 +1379,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self?.helloContinuation?.resume(throwing: CancellationError())
             self?.helloContinuation = nil
         }
-    }
-
-    /// Migrate the live session to another transport: swap the socket under
-    /// the pipeline — virtual display, capture and encoder stay up (no
-    /// display destroy/create, so no screen flash and no window reshuffle)
-    /// while the connection redials over the new transport. The receiver
-    /// treats it like any reconnect: the fresh connection replaces the old
-    /// one and the video resyncs with a keyframe. Which transport to be on
-    /// is the controller's call (cable-in upgrade, unplug failover).
-    func switchTransport(to newTransport: SenderTransport) {
-        // Transport migration is deliberately unavailable in the USB-only fork.
-        stop()
     }
 
     // The controller's end() is idempotent, but several detectors (grace,
@@ -1474,9 +1412,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// cable session can exist with (phones ride usbmuxd). Runs again when
     /// hello arrives: a fresh dial reaches ready before the first hello
     /// names the device.
-    private func refreshDirectLinkClassification(for conn: NWConnection) {
-        currentPathDirectLink = false
-    }
+
 
     /// A dial was actively refused (must be called on `queue`). On a session
     /// that has streamed before, enough refusals in a row prove the receiver
@@ -1495,13 +1431,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// a live connection outranks a flapping mDNS cache. Together they
     /// prove a WiFi receiver quit, where dials just stall instead of
     /// being refused.
-    func peerServiceWithdrawn() {
-        queue.async { [weak self] in
-            guard let self, !self.stopped, self.everConnected,
-                  !self.connectionReady else { return }
-            self.reportGone("service withdrawn and connection down — receiver app is gone, ending session")
-        }
-    }
+
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         // A retired stream commonly reports its stop after the replacement is
@@ -1707,132 +1637,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // go non-viable routinely and NW rides them out on its own, and a
         // docked Mac losing its Ethernet (undock) should fall back to WiFi,
         // not end the session.
-        conn.viabilityUpdateHandler = { [weak self] viable in
-            guard let self, self.connection === conn, !viable,
-                  self.currentPathDirectLink else { return }
-            self.linkDied("path no longer viable")
-        }
         receiveControl(on: conn)
-        refreshDirectLinkClassification(for: conn)
-        if let path = conn.currentPath {
-            let wired = !path.usesInterfaceType(.wifi) && !path.usesInterfaceType(.loopback)
-                && !path.usesInterfaceType(.cellular)
-            currentPathUsesWiFi = path.usesInterfaceType(.wifi)
-            let names = path.availableInterfaces.map(\.name).joined(separator: ",")
-            Log.info("connection path to \(endpointName): \(names) wired=\(wired) direct=\(currentPathDirectLink)")
-            Task { @MainActor in self.onTransportPath?(wired) }
-        }
-        // -forceUpgradeProbe YES: dev knob — loopback runs never look like
-        // WiFi, so this is the only way to exercise probe+migrate on one Mac.
-        if currentPathUsesWiFi || UserDefaults.standard.bool(forKey: "forceUpgradeProbe") {
-            startUpgradeProbing()
-        } else {
-            stopUpgradeProbing()   // already off WiFi — nothing better to find
-        }
+        Task { @MainActor in self.onTransportPath?(true) }
         Task { await self.status("Connected to \(self.endpointName)") }
-    }
-
-    // MARK: - Cable upgrade (PROTOCOL.md 6.4)
-
-    /// Arm the periodic probe. Cheap when there is nothing to find: with no
-    /// advertised addresses, or on the USB transport, it never fires a dial.
-    private func startUpgradeProbing() {
-        // No network probing in this fork.
-    }
-
-    private func stopUpgradeProbing() {
-        upgradeTimer?.cancel()
-        upgradeTimer = nil
-        wiredPathMonitor?.cancel()
-        wiredPathMonitor = nil
-        probeRoundGeneration += 1   // orphan any pending sweep
-        upgradeProbes.forEach { $0.cancel() }
-        upgradeProbes.removeAll()
-    }
-
-    /// One probe round: dial every candidate (receiver address × local
-    /// interface for link-local IPv6) with WiFi forbidden. mDNS resolution
-    /// stalls under interface restrictions; literal addresses do not.
-    private func probeForCablePath(force: Bool = false) {
-        // Receiver-supplied addresses are never dialed.
-    }
-
-    /// Swap the live session onto the probed connection. Same shape as a
-    /// reconnect: the receiver parks the newcomer, adopts it on our first
-    /// bytes, and the abandoned WiFi socket's EOF is ignored as stale.
-    private func migrate(to conn: NWConnection) {
-        let names = conn.currentPath?.availableInterfaces.map(\.name)
-            .joined(separator: ",") ?? "?"
-        Log.info("cable path answered (\(names)) — migrating the session off WiFi")
-        upgradeProbes.removeAll { $0 === conn }
-        stopUpgradeProbing()
-        dialGeneration += 1   // a redial in flight must not clobber this
-        closeCursorChannel()  // rebuilt from the next hello on the new path
-        // Close the video gate before publishing the new socket. Encoded
-        // callbacks deliver on `queue` and carry the old connection generation,
-        // so anything already in flight is either sent on WiFi before this
-        // method runs or discarded after the generation advances below.
-        connectionReady = false
-        // Detach the old connection's handler BEFORE cancelling: its
-        // .cancelled callback arrives after becomeReady below and would
-        // reset connectionReady, silently blackholing every send on the
-        // migrated connection.
-        connection?.stateUpdateHandler = nil
-        connection?.viabilityUpdateHandler = nil
-        connection?.cancel()
-        connection = conn
-        conn.stateUpdateHandler = { [weak self] state in
-            guard let self, self.connection === conn else { return }
-            switch state {
-            case .failed(let error):
-                Log.info("connection failed: \(error)")
-                self.connectionReady = false
-                self.linkDied("failed: \(error)")
-            case .waiting(let error):
-                Log.info("connection waiting: \(error) — will retry")
-                self.connectionReady = false
-                self.linkDied("waiting: \(error)")
-            case .cancelled:
-                self.connectionReady = false
-            default: break
-            }
-        }
-        becomeReady(conn)
-    }
-
-    /// Local zones a link-local probe could ride: interfaces that are up,
-    /// not loopback, and hold a link-local IPv6 address of their own (a
-    /// scope with no fe80 of its own answers every dial with "network is
-    /// down"). Names only — the probe carries the actual restriction via
-    /// prohibitedInterfaceTypes.
-    private static func candidateInterfaceNames() -> [String] {
-        var result: [String] = []
-        var list: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&list) == 0, let first = list else { return result }
-        defer { freeifaddrs(list) }
-        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
-            let ifa = ptr.pointee
-            let flags = Int32(ifa.ifa_flags)
-            guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0,
-                  let sa = ifa.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET6) else { continue }
-            let name = String(cString: ifa.ifa_name)
-            // anpi* completes TCP handshakes but cannot carry the stream —
-            // see the matching exclusion in StreamReceiver.
-            if name.hasPrefix("awdl") || name.hasPrefix("llw") || name.hasPrefix("utun")
-                || name.hasPrefix("gif") || name.hasPrefix("stf")
-                || name.hasPrefix("anpi") { continue }
-            let isLinkLocal = sa.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
-                var a = $0.pointee.sin6_addr
-                return withUnsafeBytes(of: &a) { $0[0] == 0xfe && ($0[1] & 0xc0) == 0x80 }
-            }
-            guard isLinkLocal else { continue }
-            if !result.contains(name) { result.append(name) }
-        }
-        return result
-    }
-
-    private func connectTCP(_ endpoint: NWEndpoint) {
-        reportGone("Network transports are disabled")
     }
 
     /// Dial over the cable: macOS's built-in usbmuxd for iPhones and iPads,
@@ -1919,12 +1726,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // Whatever this session rode is gone; deciding to redial means it is
         // an ordinary reconnecting session now. A stale direct-link flag here
         // would let the first dial hiccup end the session via linkDied.
-        currentPathDirectLink = false
         dialGeneration += 1   // a USB dial still in flight must not adopt
         let generation = dialGeneration
         connection?.cancel()
         connection = nil
-        closeCursorChannel()   // rebuilt from the next hello
         pendingSends = 0
         pipelineLock.lock()
         pendingEncodes = 0
@@ -1969,18 +1774,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 // session and display are kept on purpose so the user's
                 // window arrangement survives until they come back. Genuine
                 // network loss fails the redials and ends via the grace.
-                if self.currentPathDirectLink {
-                    // Backstop for the viability handler: silence on the
-                    // direct cable is an unplug (or a dead peer) — never
-                    // redial onto WiFi.
-                    self.linkDied("silent for >5s")
-                } else {
-                    Log.info("watchdog: nothing from the phone for >5s — reconnecting")
-                    // Can't tell a backgrounded receiver from a brief stall here
-                    // (both go silent while redials still succeed) — hedge.
-                    Task { await self.status("\(self.endpointName) is silent — keeping the display (app in background or brief stall)") }
-                    self.scheduleReconnect()
-                }
+                Task { await self.status("USB receiver is silent — reconnecting over USB") }
+                self.scheduleReconnect()
             }
             // The disconnect grace is otherwise only evaluated when a dial
             // changes state — a dial stuck in .preparing (withdrawn Bonjour
@@ -2079,19 +1874,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         cursorSeq &+= 1
         let sessionGeneration = cursorSessionGeneration
         let message = "{\"type\":\"cursor\",\(fields),\"s\":\(cursorSeq)}"
-        cursorNetworkLock.lock()
-        let udp = cursorConnection
-        let udpReady = cursorConnectionReady
-        let udpConfirmed = cursorChannelConfirmed
-        let udpGeneration = cursorConnectionGeneration
-        cursorNetworkLock.unlock()
-        if let udp, udpReady, udpGeneration == sessionGeneration {
-            udp.send(content: Data(message.utf8), completion: .contentProcessed { _ in })
-            if udpConfirmed { return }
-        }
-        // Before the UDP ack (and whenever UDP is unavailable), retain the
-        // established TCP fallback. Its queue may be busy with video, but a
-        // confirmed side channel never takes this path.
         queue.async { [weak self] in
             guard let self, self.connectionGeneration == sessionGeneration else { return }
             self.sendJSONFrame(message)
@@ -2103,21 +1885,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// host is the one the live TCP connection actually reached, so a
     /// Bonjour or Thunderbolt-bridged dial lands on the same interface. Any
     /// failure here is silent: the cursor keeps riding TCP.
-    private func openCursorChannel(port: Int) {
-        closeCursorChannel() // Cursor updates stay inside the USB stream.
-    }
 
-    private func closeCursorChannel() {
-        cursorNetworkLock.lock()
-        let oldConnection = cursorConnection
-        cursorChannelConfirmed = false
-        cursorConnectionReady = false
-        cursorConnection = nil
-        cursorChannelPort = nil
-        cursorConnectionGeneration = 0
-        cursorNetworkLock.unlock()
-        oldConnection?.cancel()
-    }
+
+
 
     private func pollCursorImage() {
         // Display size read LIVE, not snapshotted at capture start: the
@@ -2210,18 +1980,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 dropsEncThisWindow = 0
                 dropsNetThisWindow = 0
             }
-        case "cursorAck":
-            // The receiver saw our first datagram: the side channel delivers,
-            // stop mirroring positions onto TCP (PROTOCOL.md 6.3).
-            cursorNetworkLock.lock()
-            let becameConfirmed = cursorConnection != nil && !cursorChannelConfirmed
-            if becameConfirmed { cursorChannelConfirmed = true }
-            cursorNetworkLock.unlock()
-            if becameConfirmed {
-                Log.info("cursor channel confirmed by the receiver")
-            }
         case "hello":
             if let info = try? JSONDecoder().decode(PhoneInfo.self, from: payload) {
+                guard info.id.map({ UUID(uuidString: $0) != nil }) ?? true else {
+                    reportGone("Invalid USB receiver identity")
+                    return
+                }
                 let facts = info.facts
                 guard (2...16_384).contains(facts.pixelsWide),
                       (2...16_384).contains(facts.pixelsHigh), facts.scale.isFinite,
@@ -2234,27 +1998,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let previous = lastHello
                 lastHello = info
                 helloSeenOnConnection = true
-                // A fresh dial classifies before the hello names the device —
-                // now that it has, decide again (see the comment on the func).
-                if let conn = connection { refreshDirectLinkClassification(for: conn) }
                 Task { @MainActor in self.onHello?(info) }
-                if let port = info.cursorPort {
-                    openCursorChannel(port: port)
-                } else {
-                    closeCursorChannel()
-                }
-                let addrs = info.addrs ?? []
-                if addrs != peerAddrs {
-                    let firstHello = peerAddrs.isEmpty
-                    peerAddrs = addrs
-                    // A re-hello with a changed address set usually means a
-                    // cable was just plugged — probe now, not in up to 10s,
-                    // and cancel any stale round still in flight.
-                    if upgradeTimer != nil, !firstHello {
-                        Log.info("receiver addrs changed (\(addrs.count)) — probing cable paths now")
-                        probeForCablePath(force: true)
-                    }
-                }
                 // Version handshake (issue #132). Reply with our identity, and
                 // if the receiver is below the version we support, tell it to
                 // update. Both are additive: older receivers ignore unknown

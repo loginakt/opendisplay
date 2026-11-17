@@ -100,12 +100,10 @@ final class StreamReceiver: ObservableObject {
     // What the last hello advertised, to notice a cable appearing
     // mid-session: plugging one creates new interfaces, and a sender can
     // only probe addresses it has been told about.
-    private var lastAdvertisedAddrs: [String] = []
     private var addrWatchTimer: DispatchSourceTimer?
     // The cable upgrade (PROTOCOL.md 6.4) is Mac-to-Mac: only Mac
     // receivers put addrs in their hello — see sendHello for why phones
     // must not.
-    private var advertisesAddresses: Bool { deviceKind == "Mac" }
     /// Power actions this platform can carry out (PROTOCOL.md 6.6); empty
     /// on platforms that cannot power off (iOS). Set before start(). Offered
     /// in hello, and obeyed, only on a direct-cable session until pairing
@@ -269,25 +267,13 @@ final class StreamReceiver: ObservableObject {
         return fresh
     }()
 
-    private var advertisedService: NWListener.Service {
-        var txt = NWTXTRecord()
-        txt["id"] = Self.installID
-        txt["pv"] = String(WireProtocol.version)   // issue #132
-        return NWListener.Service(name: serviceName, type: "_opensidecar._tcp",
-                                  domain: nil, txtRecord: txt)
-    }
-
-    /// Update the advertised name and re-publish if already listening.
+    /// Update the local display label without publishing any network service.
     func setServiceName(_ name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let resolved = trimmed.isEmpty ? fallbackServiceName : trimmed
         queue.async {
             guard resolved != self.serviceName else { return }
             self.serviceName = resolved
-            if self.listener != nil {
-                self.listener?.service = self.advertisedService
-                Log.info("re-advertising as \"\(resolved)\"")
-            }
         }
     }
 
@@ -538,7 +524,7 @@ final class StreamReceiver: ObservableObject {
             // packets, and Nagle would hold each one until the previous is
             // ACKed — batched, late drags read as input lag.
             let params = USBOnlyTransport.receiverParameters(port: port)
-            listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+            listener = try NWListener(using: params)
         } catch {
             setStatus("Listener failed: \(error.localizedDescription)")
             return
@@ -704,21 +690,6 @@ final class StreamReceiver: ObservableObject {
         pingTimer = ping
 
         addrWatchTimer?.cancel()
-        if advertisesAddresses {
-            let addrWatch = DispatchSource.makeTimerSource(queue: queue)
-            addrWatch.schedule(deadline: .now() + 5.0, repeating: 5.0)
-            addrWatch.setEventHandler { [weak self] in
-                guard let self, let conn = self.connection, conn.state == .ready else { return }
-                let now = Self.reachableAddresses()
-                guard now != self.lastAdvertisedAddrs else { return }
-                // A cable was plugged (or pulled) mid-session: tell the sender,
-                // it re-probes on the fresh list (PROTOCOL.md 6.4).
-                Log.info("reachable addresses changed — re-sending hello")
-                self.sendHello(on: conn)
-            }
-            addrWatch.resume()
-            addrWatchTimer = addrWatch
-        }
 
         watchdogTimer?.cancel()
         let watchdog = DispatchSource.makeTimerSource(queue: queue)
@@ -934,7 +905,6 @@ final class StreamReceiver: ObservableObject {
         if acceptsPowerActions(on: conn) { hello["power"] = powerActions.map(\.rawValue) }
         let addrs: [String] = [] // Never offer network endpoints.
         if !addrs.isEmpty { hello["addrs"] = addrs }
-        lastAdvertisedAddrs = addrs
         // A provisional hello goes to a candidate while the old connection is
         // still active; it must not change bookkeeping for that live session.
         if connection === conn { cursorPortAnnounced = announcesCursorPort }
@@ -958,40 +928,7 @@ final class StreamReceiver: ObservableObject {
     /// it to each of its own candidate interfaces when probing. Virtual and
     /// peer-to-peer interfaces (awdl/llw/utun) never carry this traffic and
     /// are skipped.
-    private static func reachableAddresses() -> [String] {
-        var result: [String] = []
-        var list: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&list) == 0, let first = list else { return result }
-        defer { freeifaddrs(list) }
-        for ptr in sequence(first: first, next: { $0.pointee.ifa_next }) {
-            let ifa = ptr.pointee
-            let flags = Int32(ifa.ifa_flags)
-            guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0,
-                  let sa = ifa.ifa_addr else { continue }
-            let name = String(cString: ifa.ifa_name)
-            // anpi* is Apple's internal peripheral/debug interface: TCP
-            // handshakes complete over it but it cannot carry the stream —
-            // a session migrated onto it stalls within seconds (field log
-            // 18:59). The user-facing USB-C host-to-host link is a plain en.
-            if name.hasPrefix("awdl") || name.hasPrefix("llw") || name.hasPrefix("utun")
-                || name.hasPrefix("pdp_ip") || name.hasPrefix("anpi") { continue }
-            let family = sa.pointee.sa_family
-            guard family == UInt8(AF_INET) || family == UInt8(AF_INET6) else { continue }
-            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-            let len = family == UInt8(AF_INET)
-                ? socklen_t(MemoryLayout<sockaddr_in>.size)
-                : socklen_t(MemoryLayout<sockaddr_in6>.size)
-            guard getnameinfo(sa, len, &host, socklen_t(host.count),
-                              nil, 0, NI_NUMERICHOST) == 0 else { continue }
-            var addr = String(cString: host)
-            // getnameinfo appends %scope to link-local IPv6 — strip it, the
-            // receiver-side zone id is meaningless to the sender.
-            if let percent = addr.firstIndex(of: "%") { addr = String(addr[..<percent]) }
-            if !result.contains(addr) { result.append(addr) }
-            if result.count >= 12 { break }
-        }
-        return result
-    }
+
 
     /// Touch events: x/y normalized [0,1] in video space, origin top-left.
     /// Stamped in *Mac* clock time (our clock + sync offset) so the Mac can

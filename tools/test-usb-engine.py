@@ -20,3 +20,28 @@ try:
 finally:
     if p.poll() is None: p.kill(); p.wait()
 print('PASS: rejected network CLI, USB-only initial state, no IPv4/IPv6 sockets, parent EOF terminates engine')
+# Keep stdin's writer alive after the parent crashes; EOF cannot explain this exit.
+import os, time
+read_fd, write_fd = os.pipe()
+status_read, status_write = os.pipe()
+proxy_code = 'import subprocess,sys,time; p=subprocess.Popen([sys.argv[1],"--control-stdio"],stdin=int(sys.argv[2]),stdout=int(sys.argv[3]),stderr=subprocess.DEVNULL); print(p.pid,flush=True); time.sleep(30)'
+proxy = subprocess.Popen([sys.executable, '-c', proxy_code, engine, str(read_fd), str(status_write)], pass_fds=(read_fd,status_write), stdout=subprocess.PIPE, text=True)
+helper_pid = int(proxy.stdout.readline())
+os.close(read_fd); os.close(status_write)
+try:
+    selector = selectors.DefaultSelector(); selector.register(status_read, selectors.EVENT_READ)
+    assert selector.select(10), 'orphan test helper did not start'
+    assert json.loads(os.read(status_read, 65_536).splitlines()[0])['transport'] == 'usb'
+    proxy.kill(); proxy.wait(timeout=5)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        state = subprocess.run(['/bin/ps','-p',str(helper_pid),'-o','stat='], capture_output=True,text=True).stdout.strip()
+        if not state or state.startswith('Z'): break
+        time.sleep(0.05)
+    else: raise AssertionError('orphan helper survived parent death with stdin held open')
+finally:
+    if proxy.poll() is None: proxy.kill(); proxy.wait()
+    os.close(write_fd); os.close(status_read)
+    try: os.kill(helper_pid, 9)
+    except ProcessLookupError: pass
+print('PASS: parent-process watchdog exits even when another process keeps stdin open')

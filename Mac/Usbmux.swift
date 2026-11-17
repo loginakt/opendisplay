@@ -232,10 +232,12 @@ final class UsbmuxDeviceWatcher {
         }
     }
 
+    func refresh() { Task { await loadInitiallyAttachedDevices() } }
+
     private func loadInitiallyAttachedDevices() async {
         do {
             let attached = try await Usbmux.listDevices(queue: queue)
-            guard !attached.isEmpty else { return }
+            devices = Dictionary(uniqueKeysWithValues: attached.map { ($0.deviceID, $0) })
             for device in attached {
                 devices[device.deviceID] = device
                 Log.info("usbmux initial device: \(device.udid)")
